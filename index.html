@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lloci room</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: rgba(18, 21, 26, 0.82);
+    --line: rgba(255, 255, 255, 0.09);
+    --text: #e8ebef;
+    --muted: #8b939e;
+    --aura: #59e6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+
+  #bar { position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    width: min(560px, calc(100% - 32px)); display: flex; gap: 8px; padding: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  #q { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--text);
+    font: inherit; font-size: 16px; padding: 6px 8px; }
+  #q::placeholder { color: var(--muted); }
+  button { font: inherit; color: var(--text); background: rgba(255,255,255,0.06);
+    border: 1px solid var(--line); border-radius: 9px; padding: 6px 12px; cursor: pointer; }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button.primary { background: var(--aura); color: #031014; border-color: transparent; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+
+  #status { position: fixed; top: 74px; left: 50%; transform: translateX(-50%);
+    color: var(--muted); font-size: 12.5px; white-space: nowrap; text-shadow: 0 1px 3px #000; }
+
+  #matches { position: fixed; left: 16px; right: 16px; bottom: 16px; display: flex; gap: 8px;
+    justify-content: center; overflow-x: auto; padding-bottom: 2px; }
+  .m { flex: 0 0 auto; width: 92px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; overflow: hidden; cursor: pointer; padding: 0; }
+  .m:hover { border-color: var(--aura); }
+  .m .t { width: 92px; height: 72px; background-color: #111; background-repeat: no-repeat; }
+  .m span { display: block; font-size: 11px; color: var(--muted); padding: 3px 6px;
+    font-variant-numeric: tabular-nums; text-align: left; }
+
+  #model { position: fixed; left: 50%; bottom: 104px; transform: translateX(-50%); color: var(--muted);
+    font-size: 12px; text-shadow: 0 1px 3px #000; white-space: nowrap; }
+  #tools { position: fixed; right: 16px; top: 16px; display: flex; flex-direction: column; gap: 8px;
+    align-items: stretch; }
+  #tools label { font-size: 11.5px; color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 9px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px; }
+  input[type=range] { accent-color: var(--aura); width: 110px; }
+
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg);
+    transition: opacity .4s; z-index: 5; }
+  #loading div { width: 220px; text-align: center; color: var(--muted); }
+  #loading i { display: block; height: 3px; margin-top: 10px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  #loading b { display: block; height: 100%; width: 0; background: var(--aura); transition: width .2s; }
+
+  #drop { position: fixed; inset: 0; border: 2px dashed var(--aura); background: rgba(89,230,255,0.06);
+    display: none; place-items: center; font-size: 18px; z-index: 4; pointer-events: none; }
+  body.dragging #drop { display: grid; }
+
+  @media (max-width: 720px) {
+    #tools { top: auto; bottom: 120px; }
+    #status { top: 70px; font-size: 11.5px; }
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+    "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.3.1/dist/spark.module.js",
+    "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1"
+  }
+}
+</script>
+</head>
+<body>
+<div id="loading"><div>Loading room…<i><b id="progress"></b></i></div></div>
+
+<form id="bar" autocomplete="off">
+  <input id="q" placeholder="What are you looking for?  e.g. a bottle" aria-label="Search the room">
+  <button class="primary" type="submit">Find</button>
+  <button type="button" id="clear" title="Clear (Esc)">Clear</button>
+</form>
+<div id="status">Loading…</div>
+
+<div id="tools">
+  <button type="button" id="reset">Reset view</button>
+  <label>Glow <input id="glow" type="range" min="0.2" max="2" step="0.1" value="1"></label>
+</div>
+<div id="matches"></div>
+<div id="model"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const $ = (id) => document.getElementById(id);
+// Which scene to show: ./<scene>/ next to this page (default "room"), e.g. ?scene=drjohnson
+const B = `./${(new URLSearchParams(location.search).get("scene") || "room").replace(/[^\w-]/g, "")}/`;
+const status = (t) => ($("status").textContent = t);
+const scene3 = await (await fetch(`${B}scene.json`)).json();
+
+
+// ---- query encoder: EmbeddingGemma 2 text model running in this browser (no server) ----
+import { pipeline, AutoConfig } from "@huggingface/transformers";
+const MODEL_ID = "onnx-community/embeddinggemma-2-ONNX";
+const fileProgress = {};
+let modelState = "loading";
+const extractorReady = (async () => {
+  // Text queries only need the 270M text model. transformers.js loads the vision and audio
+  // encoders only when the config lists them, so drop both: ~175 MB download instead of ~505 MB.
+  const config = await AutoConfig.from_pretrained(MODEL_ID);
+  config.vision_config = null;
+  config.audio_config = null;
+  const opts = { config, dtype: "q4", progress_callback: (e) => {
+    if (e.status === "progress" && e.total) {
+      fileProgress[e.file] = [e.loaded, e.total];
+      const [l, t] = Object.values(fileProgress).reduce((a, b) => [a[0] + b[0], a[1] + b[1]], [0, 0]);
+      if (modelState === "loading") $("model").textContent = `Search model ${(100 * l / t).toFixed(0)}% of ${(t / 1e6).toFixed(0)} MB (downloads once)`;
+    }
+  } };
+  let ex;
+  try { ex = await pipeline("feature-extraction", MODEL_ID, { ...opts, device: navigator.gpu ? "webgpu" : "wasm" }); }
+  catch (e) { ex = await pipeline("feature-extraction", MODEL_ID, { ...opts, device: "wasm" }); }
+  modelState = "ready"; $("model").textContent = "";
+  return ex;
+})().catch((e) => { modelState = "failed"; $("model").textContent = `Search model failed to load: ${e.message}`; throw e; });
+
+async function embed(q) {
+  if (modelState === "loading") status("Waiting for the search model to finish downloading…");
+  const ex = await extractorReady;
+  const out = await ex(`task: search result | query: ${q}`, { pooling: "mean", normalize: true });
+  const v = Array.from(out.data).slice(0, scene3.dim);           // Matryoshka: keep the first DIM numbers
+  const n = Math.hypot(...v);
+  return v.map((x) => x / n);
+}
+
+// ---- renderer, camera, controls ----
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: false });
+} catch (e) {
+  document.querySelector("#loading div").textContent =
+    "This browser could not start WebGL 2 (it may have blocked it after a GPU reset). Restart the browser and reload.";
+  throw e;
+}
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));   // 1.1M splats; full retina costs more than it shows
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+renderer.domElement.addEventListener("webglcontextlost", () => status("GPU context lost. Reload the page to continue."));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d10);
+scene.add(new SparkRenderer({ renderer }));
+
+const camera = new THREE.PerspectiveCamera(scene3.fovy, innerWidth / innerHeight, 0.02, 200);
+camera.up.fromArray(scene3.up);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const centre = new THREE.Vector3().fromArray(scene3.centre);
+
+function framePose(frame) {
+  const m = new THREE.Matrix4().set(...scene3.cameras[frame]);
+  const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
+  m.decompose(pos, quat, new THREE.Vector3());
+  return { pos, quat };
+}
+
+function lookFrom(frame, target) {
+  const { pos, quat } = framePose(frame);
+  if (!target) {
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+    const d = Math.max(1.0, centre.clone().sub(pos).dot(fwd));
+    target = pos.clone().add(fwd.multiplyScalar(d));
+  }
+  return { pos, target };
+}
+
+// smooth camera moves
+let flight = null;
+function flyTo({ pos, target }, ms = 900) {
+  flight = { t0: performance.now(), ms,
+    p0: camera.position.clone(), p1: pos.clone(),
+    q0: controls.target.clone(), q1: target.clone() };
+}
+function stepFlight(now) {
+  if (!flight) return;
+  let k = Math.min(1, (now - flight.t0) / flight.ms);
+  k = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+  camera.position.lerpVectors(flight.p0, flight.p1, k);
+  controls.target.lerpVectors(flight.q0, flight.q1, k);
+  if (k >= 1) flight = null;
+}
+
+const home = lookFrom(String(scene3.start));
+camera.position.copy(home.pos);
+controls.target.copy(home.target);
+
+// ---- splat ----
+const mesh = new SplatMesh({
+  url: `${B}scene.ply`,
+  lod: false,
+  onProgress: (e) => { if (e.total) $("progress").style.width = `${(100 * e.loaded / e.total).toFixed(0)}%`; },
+});
+scene.add(mesh);
+await mesh.initialized;
+const splats = mesh.packedSplats;
+const N = splats.numSplats;
+window.room = { mesh, splats, camera, controls, scene };   // for poking at from the devtools console
+$("loading").style.opacity = 0;
+setTimeout(() => $("loading").remove(), 450);
+
+// ---- aura: dim everything, then add cyan light where the aura is ----
+// Each packed splat is 4 uint32 words; word 0 holds R,G,B,A bytes. Only those colour bytes are
+// rewritten, so position/rotation/scale are never re-encoded (setSplat would do that, lossily).
+const packed = splats.packedArray;
+const base = new Uint32Array(N);
+for (let i = 0; i < N; i++) base[i] = packed[4 * i];
+const enc = splats.splatEncoding ?? {};
+const rgbMin = enc.rgbMin ?? 0, rgbRange = (enc.rgbMax ?? 1) - rgbMin;
+const toByte = (v) => Math.max(0, Math.min(255, Math.round(((v - rgbMin) / rgbRange) * 255)));
+const glowColor = new THREE.Color(0x59e6ff);
+// work in byte space: decoded = rgbMin + byte/255*range, so dimming and adding map to bytes linearly
+const off = (-rgbMin / rgbRange) * 255;              // byte value of colour 0
+const glowB = [glowColor.r, glowColor.g, glowColor.b].map((v) => toByte(v) - off);
+
+// ---- bundle: int8 index + precomputed crop -> cluster aura table ----
+const bin = async (f, T) => new T(await (await fetch(`${B}${f}`)).arrayBuffer());
+const CL = scene3.cluster_dtype === "u16" ? Uint16Array : Uint32Array;
+const [index, auraPtr, auraCl, auraW, clusterOf, centroids] = await Promise.all([
+  bin("index.i8", Int8Array), bin("aura_ptr.bin", Uint32Array), bin("aura_cl.bin", CL),
+  bin("aura_w.bin", Uint8Array), bin("cluster.bin", CL), bin("centroids.bin", Float32Array),
+]);
+const D = scene3.dim, nCrops = scene3.crops.length, nClusters = scene3.clusters;
+const clusterScore = new Float32Array(nClusters);
+
+let aura = null;   // per-cluster 0..1, or null
+function paint() {
+  const g = parseFloat($("glow").value);
+  for (let i = 0; i < N; i++) {
+    const w = base[i];
+    if (!aura) { packed[4 * i] = w; continue; }
+    const a = Math.min(1, aura[clusterOf[i]] * g);
+    if (a < 0.004) {   // most splats: just dim
+      packed[4 * i] = ((((w & 255) - off) * 0.3 + off) | 0)
+        | (((((w >>> 8) & 255) - off) * 0.3 + off) | 0) << 8
+        | (((((w >>> 16) & 255) - off) * 0.3 + off) | 0) << 16
+        | (w & 0xff000000);
+      continue;
+    }
+    const lift = 0.3 + 0.7 * a, add = 0.95 * a * Math.sqrt(a);
+    const r = off + ((w & 255) - off) * lift + glowB[0] * add;
+    const gg = off + (((w >>> 8) & 255) - off) * lift + glowB[1] * add;
+    const b = off + (((w >>> 16) & 255) - off) * lift + glowB[2] * add;
+    packed[4 * i] = (Math.max(0, Math.min(255, r | 0))
+      | (Math.max(0, Math.min(255, gg | 0)) << 8)
+      | (Math.max(0, Math.min(255, b | 0)) << 16)
+      | (w & 0xff000000)) >>> 0;
+  }
+  splats.needsUpdate = true;
+}
+
+// Search entirely in the browser: dot products against the int8 index, then sum the
+// precomputed cluster weights of the best 40 object crops (softmax-style weighting).
+function searchVector(v) {
+  const scores = new Float32Array(nCrops);
+  for (let j = 0, o = 0; j < nCrops; j++, o += D) {
+    let s = 0;
+    for (let k = 0; k < D; k++) s += index[o + k] * v[k];
+    scores[j] = s / scene3.qscale;
+  }
+  const order = Array.from(scores.keys()).sort((a, b) => scores[b] - scores[a]);
+  const lifted = order.filter((j) => scene3.crops[j][5]).slice(0, 40);
+  clusterScore.fill(0);
+  const s0 = scores[lifted[0]];
+  for (const j of lifted) {
+    const wj = Math.exp((scores[j] - s0) / 0.01);
+    for (let p = auraPtr[j]; p < auraPtr[j + 1]; p++) clusterScore[auraCl[p]] += wj * auraW[p] / 255;
+  }
+  let mx = 0;
+  for (let c = 0; c < nClusters; c++) mx = Math.max(mx, clusterScore[c]);
+  for (let c = 0; c < nClusters; c++) clusterScore[c] = mx > 0 ? clusterScore[c] / mx : 0;
+  // Aim at the best single match, not the average of every glow: with several matching objects
+  // (a house has more than one fireplace) the average lands between them, inside a wall.
+  const focus = new THREE.Vector3(); let fw = 0;
+  for (let p = auraPtr[lifted[0]]; p < auraPtr[lifted[0] + 1]; p++) {
+    const c = auraCl[p], a = auraW[p] / 255;
+    if (a < 0.5) continue;   // skip the halo, keep the object's own clusters
+    focus.x += centroids[3*c] * a; focus.y += centroids[3*c+1] * a; focus.z += centroids[3*c+2] * a; fw += a;
+  }
+  if (fw > 0) focus.divideScalar(fw); else focus.copy(centre);
+  let lit = 0;
+  for (let i = 0; i < N; i++) if (clusterScore[clusterOf[i]] > 0.5) lit++;
+  return { scores, top: order.slice(0, 8), view: scene3.crops[lifted[0]][0], focus, lit };
+}
+
+function showMatches(r) {
+  const box = $("matches");
+  box.replaceChildren();
+  for (const j of r.top) {
+    const [frame, x0, y0, x1, y1] = scene3.crops[j];
+    const k = Math.min(92 / (x1 - x0), 72 / (y1 - y0));          // fit the crop into the 92x72 tile
+    const el = document.createElement("button");
+    el.className = "m";
+    el.title = `photo ${frame}: fly to this photo's viewpoint`;
+    el.innerHTML = `<div class="t"></div><span>${r.scores[j].toFixed(3)}</span>`;
+    Object.assign(el.firstChild.style, {
+      backgroundImage: `url(${B}frames/${frame}.jpg)`,
+      backgroundSize: `${scene3.width * k}px auto`,
+      backgroundPosition: `${-x0 * k + (92 - (x1 - x0) * k) / 2}px ${-y0 * k + (72 - (y1 - y0) * k) / 2}px`,
+    });
+    el.onclick = () => flyTo(lookFrom(frame, r.focus));
+    box.append(el);
+  }
+}
+
+async function search(q) {
+  status(`Searching for “${q}”…`);
+  try {
+    const t = performance.now();
+    const v = await embed(q);
+    const t1 = performance.now();
+    const r = searchVector(v);
+    aura = clusterScore;
+    paint();
+    const t2 = performance.now();
+    showMatches(r);
+    flyTo(lookFrom(r.view, r.focus));
+    status(`“${q}” · best ${r.scores[r.top[0]].toFixed(3)} · ${r.lit.toLocaleString()} splats glowing · ` +
+           `query ${Math.round(t1 - t)} ms, search+aura ${Math.round(t2 - t1)} ms`);
+  } catch (e) {
+    status(`Search failed: ${e.message}`);
+  }
+}
+
+$("bar").onsubmit = (e) => {
+  e.preventDefault();
+  const q = $("q").value.trim();
+  if (q) search(q);
+};
+function clear() {
+  aura = null; paint();
+  $("matches").replaceChildren();
+  status(`${scene3.scene} · ${N.toLocaleString()} splats · type what you're looking for`);
+}
+clear();
+$("clear").onclick = clear;
+$("reset").onclick = () => flyTo(home);
+$("glow").oninput = () => aura && paint();
+addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== $("q")) { e.preventDefault(); $("q").focus(); }
+  if (e.key === "Escape") { $("q").blur(); clear(); }
+});
+
+// Track the window size every frame: a page opened in a hidden or zero-sized view never
+// gets a resize event when it becomes visible, and would keep a 0x0 canvas forever.
+const size = new THREE.Vector2();
+function fitToWindow() {
+  renderer.getSize(size);
+  if (size.x === innerWidth && size.y === innerHeight) return;
+  camera.aspect = innerWidth / Math.max(1, innerHeight);
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+renderer.setAnimationLoop((now) => {
+  fitToWindow();
+  stepFlight(now);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
